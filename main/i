@@ -1,0 +1,33 @@
+"""
+AgroLand MVP — Telegram-бот спутникового мониторинга полей.
+
+Данные: Sentinel-2 (Google Earth Engine) + прогноз погоды Open-Meteo.
+Без датчиков и дронов. Все пороги ниже — стартовые, их нужно калибровать
+по наземным замерам.
+
+Запуск:
+    pip install -r requirements.txt
+    earthengine authenticate          # один раз
+    export BOT_TOKEN="токен_от_BotFather"
+    export GEE_PROJECT="id_вашего_google_cloud_проекта"
+    python agroland_bot.py
+"""
+import asyncio
+import json
+import logging
+import os
+from datetime import datetime, timedelta, timezone
+
+import ee
+import requests
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandObject
+from aiogram.types import (
+    BufferedInputFile,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
+
