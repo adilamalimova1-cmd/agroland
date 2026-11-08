@@ -30,4 +30,473 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
 )
+# настройки
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GEE_PROJECT = os.getenv("GEE_PROJECT")
+
+DEFAULT_RADIUS = 1000          # радиус участка вокруг точки, м
+MAX_CLOUD = 20                 # макс. облачность сцены, %
+FORECAST_DAYS = 5              # горизонт прогноза, дней
+ALERT_EVERY_HOURS = 24         # как часто проверять подписанные поля
+USERS_FILE = "users.json"
+
+# Пороги (стартовые, требуют калибровки по полю)
+VEG_NDVI = 0.30                # NDVI от этого значения — пиксель с вегетацией
+BARE_NDVI = 0.20               # NDVI ниже — открытая почва
+NDMI_DRY = 0.05                # NDMI ниже — растения сильно недополучают воды
+NDMI_WARN = 0.15               # NDMI ниже — влажность пониженная
+WATER_DEFICIT_MM = 20          # (ET0 - осадки) за период прогноза, мм
+SI_SALT = 0.25                 # индекс SI выше (на открытой почве) — подозрение на соли
+MIN_BARE_FRAC = 0.15           # меньше этой доли открытой почвы засоление не оценивается
+MIN_VEG_FRAC = 0.20            # меньше этой доли растений влажность не оценивается
+NDVI_DROP = -0.15              # падение NDVI за 30 дней, считающееся аномалией
+
+logging.basicConfig(level=logging.INFO)
+
+#гугл земля
+
+def init_ee() -> None:
+    try:
+        ee.Initialize(project=GEE_PROJECT)
+        logging.info("Google Earth Engine инициализирован.")
+    except Exception:
+        logging.exception(
+            "Не удалось инициализировать Earth Engine. "
+            "Выполните 'earthengine authenticate' и проверьте GEE_PROJECT."
+        )
+        raise
+
+
+def _mask_clouds(img):
+    """Убираем тени, облака и снег по слою классификации SCL."""
+    scl = img.select("SCL")
+    bad = (
+        scl.eq(3).Or(scl.eq(8)).Or(scl.eq(9)).Or(scl.eq(10)).Or(scl.eq(11))
+    )
+    return img.updateMask(bad.Not())
+
+
+def get_composite(roi, start: str, end: str):
+    """Медианный композит Sentinel-2 (отражение 0–1). Возвращает (img, число_сцен)."""
+    col = (
+        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+        .filterBounds(roi)
+        .filterDate(start, end)
+        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", MAX_CLOUD))
+        .map(_mask_clouds)
+    )
+    n = col.size().getInfo()
+    if n == 0:
+        return None, 0
+    img = col.select(["B2", "B3", "B4", "B8", "B11"]).median().divide(10000)
+    return img, n
+
+
+def get_indices(img):
+    ndvi = img.normalizedDifference(["B8", "B4"]).rename("NDVI")
+    ndmi = img.normalizedDifference(["B8", "B11"]).rename("NDMI")
+    si = img.select("B3").multiply(img.select("B4")).sqrt().rename("SI")
+    return ndvi, ndmi, si
+
+
+#погода
+
+def get_weather(lat: float, lon: float):
+    """Сумма осадков и испаряемости (ET0) на ближайшие дни. None при ошибке."""
+    try:
+        resp = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "daily": "precipitation_sum,et0_fao_evapotranspiration,"
+                         "temperature_2m_max",
+                "forecast_days": FORECAST_DAYS,
+                "timezone": "auto",
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        d = resp.json()["daily"]
+        return {
+            "precip": sum(x or 0 for x in d["precipitation_sum"]),
+            "et0": sum(x or 0 for x in d["et0_fao_evapotranspiration"]),
+            "tmax": max(x for x in d["temperature_2m_max"] if x is not None),
+        }
+    except Exception:
+        logging.exception("Open-Meteo недоступен")
+        return None
+
+
+
+# риски
+
+def assess_drought(stats: dict, weather):
+    """Возвращает (уровень 0/1/2, текст)."""
+    ndmi = stats.get("NDMI_VEG")
+    veg = stats.get("VEG_FRAC") or 0
+    if ndmi is None or veg < MIN_VEG_FRAC:
+        return 0, "Растительности на участке мало — влажность посевов не оценивается."
+
+    deficit = None
+    if weather:
+        deficit = weather["et0"] - weather["precip"]
+    dry_ahead = deficit is not None and deficit > WATER_DEFICIT_MM
+
+    if ndmi < NDMI_DRY and (dry_ahead or deficit is None):
+        return 2, ("🔴 Высокий риск засухи: растения уже испытывают дефицит влаги"
+                   + (", а осадков в прогнозе недостаточно." if dry_ahead else "."))
+    if ndmi < NDMI_DRY:
+        return 1, "🟠 Влажность растений низкая, но прогноз осадков смягчает риск."
+    if ndmi < NDMI_WARN and dry_ahead:
+        return 1, ("🟠 Риск засухи в ближайшие дни: влажность растений пониженная, "
+                   "испарение заметно превышает осадки.")
+    if ndmi < NDMI_WARN:
+        return 0, "🟡 Влажность растений немного ниже нормы, следите за динамикой."
+    return 0, "🟢 Влажность растений в норме."
+
+
+def assess_salt(stats: dict) -> str:
+    bare = stats.get("BARE_FRAC")
+    si = stats.get("SI_BARE")
+    if bare is None or si is None or bare < MIN_BARE_FRAC:
+        return ("⚪ Засоление по снимку не оценить: почва закрыта растениями. "
+                "Нужны замеры на открытой земле.")
+    if si > SI_SALT:
+        return ("🟠 Возможное засоление на открытых участках. "
+                "Рекомендуется проверить пробами на месте.")
+    return "🟢 Признаков повышенного засоления на открытой почве не видно."
+
+#основной анализ
+def analyze(lat: float, lon: float, radius: int, with_map: bool = True):
+    roi = ee.Geometry.Point([lon, lat]).buffer(radius)
+
+    today = datetime.now(timezone.utc).date()
+    cur_start = today - timedelta(days=30)
+    prev_start = today - timedelta(days=60)
+
+    img, n_cur = get_composite(
+        roi, cur_start.isoformat(), (today + timedelta(days=1)).isoformat()
+    )
+    if img is None:
+        return None
+    img_prev, _ = get_composite(roi, prev_start.isoformat(), cur_start.isoformat())
+
+    ndvi, ndmi, si = get_indices(img)
+
+    veg_mask = ndvi.gte(VEG_NDVI)
+    bare_mask = ndvi.lt(BARE_NDVI)
+
+    bands = ee.Image.cat([
+        ndvi,
+        ndmi.updateMask(veg_mask).rename("NDMI_VEG"),
+        si.updateMask(bare_mask).rename("SI_BARE"),
+        veg_mask.rename("VEG_FRAC"),
+        bare_mask.rename("BARE_FRAC"),
+    ])
+
+    dndvi = None
+    if img_prev is not None:
+        ndvi_prev, _, _ = get_indices(img_prev)
+        dndvi = ndvi.subtract(ndvi_prev).rename("DNDVI")
+        bands = bands.addBands(dndvi)
+
+    stats = bands.reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=roi,
+        scale=20,
+        bestEffort=True,
+        maxPixels=1e9,
+    ).getInfo()
+
+    if stats.get("NDVI") is None:
+        return None
+
+    weather = get_weather(lat, lon)
+    drought_level, drought_text = assess_drought(stats, weather)
+
+    image_bytes = None
+    if with_map:
+        try:
+            image_bytes = build_map(roi, img, ndvi, ndmi, si, dndvi)
+        except Exception:
+            logging.exception("Не удалось построить карту")
+
+    return {
+        "stats": stats,
+        "weather": weather,
+        "n_scenes": n_cur,
+        "period": f"{cur_start.strftime('%d.%m')}–{today.strftime('%d.%m.%Y')}",
+        "drought_level": drought_level,
+        "drought_text": drought_text,
+        "salt_text": assess_salt(stats),
+        "image_bytes": image_bytes,
+    }
+
+
+def build_map(roi, img, ndvi, ndmi, si, dndvi) -> bytes:
+    """Снимок поля с цветными зонами: красный — падение NDVI,
+    оранжевый — дефицит влаги, голубой — подозрение на соли."""
+
+    def overlay(mask, color):
+        return (
+            ee.Image.constant(1).updateMask(mask).visualize(palette=[color])
+        )
+
+    rgb = img.select(["B4", "B3", "B2"]).unmask(0).visualize(min=0, max=0.3)
+    layers = [rgb]
+
+    if dndvi is not None:
+        layers.append(overlay(dndvi.lt(NDVI_DROP), "#FF0000"))
+    layers.append(overlay(ndmi.lt(NDMI_DRY).And(ndvi.gte(VEG_NDVI)), "#FF9800"))
+    layers.append(overlay(si.gt(SI_SALT).And(ndvi.lt(BARE_NDVI)), "#00E5FF"))
+
+    final = layers[0]
+    for layer in layers[1:]:
+        final = final.blend(layer)
+
+    url = final.clip(roi).getThumbURL({
+        "region": roi.bounds().getInfo(),
+        "dimensions": 800,
+        "format": "png",
+    })
+    resp = requests.get(url, timeout=60)
+    resp.raise_for_status()
+    return resp.content
+
+
+#Текст отчёта 
+
+
+def _f(value, digits=2):
+    return "н/д" if value is None else f"{value:.{digits}f}"
+
+
+def build_report(lat: float, lon: float, r: dict) -> str:
+    s, w = r["stats"], r["weather"]
+    ndvi = s.get("NDVI")
+
+    if ndvi is None:
+        veg_text = "нет данных"
+    elif ndvi >= 0.5:
+        veg_text = "густая здоровая вегетация"
+    elif ndvi >= 0.3:
+        veg_text = "умеренная вегетация"
+    elif ndvi >= 0.2:
+        veg_text = "слабая вегетация"
+    else:
+        veg_text = "в основном открытая почва или нет активной вегетации"
+
+    lines = [
+        f"<b>📊 Отчёт по участку ({lat:.4f}, {lon:.4f})</b>",
+        f"Sentinel-2: {r['n_scenes']} снимков за {r['period']}",
+        "",
+        f"🌱 <b>NDVI:</b> {_f(ndvi)} — {veg_text}",
+        f"💧 <b>NDMI (влажность растений):</b> {_f(s.get('NDMI_VEG'))}",
+    ]
+
+    if w:
+        lines.append(
+            f"🌦 Прогноз на {FORECAST_DAYS} дн.: осадки {w['precip']:.0f} мм, "
+            f"испарение {w['et0']:.0f} мм, до {w['tmax']:.0f}°C"
+        )
+    else:
+        lines.append("🌦 Прогноз погоды сейчас недоступен.")
+
+    lines += ["", r["drought_text"], r["salt_text"]]
+
+    d = s.get("DNDVI")
+    if d is not None:
+        lines.append("")
+        lines.append(f"📉 <b>Изменение NDVI за 30 дней:</b> {d:+.2f}")
+        if d < NDVI_DROP:
+            lines.append(
+                "Заметное падение вегетации. Причиной может быть стресс, "
+                "болезнь или обычная уборка урожая — сверьте с графиком посевов."
+            )
+
+    lines += [
+        "",
+        "🗺 На карте: красный — падение NDVI, оранжевый — дефицит влаги, "
+        "голубой — возможные соли.",
+        "<i>Это предварительная оценка по спутнику. Пороги не калиброваны, "
+        "решения лучше подтверждать осмотром поля.</i>",
+    ]
+    return "\n".join(lines)
+
+
+#Хранилище пользователей 
+
+
+def load_users() -> dict:
+    if os.path.exists(USERS_FILE):
+        try:
+            with open(USERS_FILE, encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception:
+            logging.exception("Не удалось прочитать users.json")
+    return {}
+
+
+def save_users() -> None:
+    with open(USERS_FILE, "w", encoding="utf-8") as fh:
+        json.dump(users, fh, ensure_ascii=False, indent=2)
+
+
+users: dict = load_users()
+
+#Telegram 
+
+dp = Dispatcher()
+
+LOCATION_KB = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="📍 Отправить локацию поля", request_location=True)]],
+    resize_keyboard=True,
+)
+
+HELP_TEXT = (
+    "Отправьте геолокацию поля, и я посчитаю по спутнику Sentinel-2 "
+    "вегетацию, влажность растений и признаки засоления, добавлю прогноз "
+    f"погоды на {FORECAST_DAYS} дней и пришлю карту зон.\n\n"
+    "Команды:\n"
+    "/radius 500 — радиус участка в метрах (100–3000)\n"
+    "/watch — следить за последним участком и присылать оповещения\n"
+    "/unwatch — отключить оповещения"
+)
+
+
+@dp.message(Command("start", "help"))
+async def cmd_start(message: Message):
+    await message.answer(
+        "👋 Салом! Я AgroLand — спутниковый помощник агронома.\n\n" + HELP_TEXT,
+        reply_markup=LOCATION_KB,
+    )
+
+
+@dp.message(Command("radius"))
+async def cmd_radius(message: Message, command: CommandObject):
+    uid = str(message.chat.id)
+    try:
+        value = int((command.args or "").strip())
+        if not 100 <= value <= 3000:
+            raise ValueError
+    except ValueError:
+        await message.answer("Укажите радиус числом от 100 до 3000, например: /radius 500")
+        return
+    users.setdefault(uid, {})["radius"] = value
+    save_users()
+    await message.answer(f"Радиус участка: {value} м. Отправьте локацию заново.")
+
+
+@dp.message(Command("watch"))
+async def cmd_watch(message: Message):
+    u = users.get(str(message.chat.id))
+    if not u or "lat" not in u:
+        await message.answer("Сначала отправьте локацию поля.")
+        return
+    u["watch"] = True
+    u["last_level"] = 0
+    save_users()
+    await message.answer(
+        "🔔 Слежу за участком. Напишу, если вырастет риск засухи."
+    )
+
+
+@dp.message(Command("unwatch"))
+async def cmd_unwatch(message: Message):
+    u = users.get(str(message.chat.id))
+    if u:
+        u["watch"] = False
+        save_users()
+    await message.answer("Оповещения отключены.")
+
+
+@dp.message(F.location)
+async def on_location(message: Message):
+    uid = str(message.chat.id)
+    u = users.setdefault(uid, {})
+    u.setdefault("radius", DEFAULT_RADIUS)
+    u["lat"] = message.location.latitude
+    u["lon"] = message.location.longitude
+    save_users()
+
+    await message.answer("⏳ Загружаю снимки Sentinel-2 и считаю индексы, это займёт до минуты...")
+
+    try:
+        r = await asyncio.to_thread(
+            analyze, u["lat"], u["lon"], u["radius"], True
+        )
+    except Exception:
+        logging.exception("Ошибка анализа")
+        await message.answer("⚠️ Не удалось обработать участок. Попробуйте ещё раз позже.")
+        return
+
+    if r is None:
+        await message.answer(
+            "Не нашёл чистых снимков над участком за последние 30 дней. "
+            "Попробуйте позже или другую точку."
+        )
+        return
+
+    if r["image_bytes"]:
+        await message.answer_photo(
+            BufferedInputFile(r["image_bytes"], filename="agroland_map.png"),
+            caption="🗺 Карта зон",
+        )
+    await message.answer(build_report(u["lat"], u["lon"], r))
+
+
+#  Фоновые оповещения 
+
+
+async def alert_loop(bot: Bot):
+    while True:
+        for uid, u in list(users.items()):
+            if not u.get("watch") or "lat" not in u:
+                continue
+            try:
+                r = await asyncio.to_thread(
+                    analyze, u["lat"], u["lon"], u.get("radius", DEFAULT_RADIUS), False
+                )
+                if r is None:
+                    continue
+                level = r["drought_level"]
+                if level >= 1 and level > u.get("last_level", 0):
+                    await bot.send_message(
+                        int(uid),
+                        "🔔 <b>Оповещение AgroLand</b>\n\n"
+                        + build_report(u["lat"], u["lon"], r),
+                    )
+                u["last_level"] = level
+                save_users()
+            except Exception:
+                logging.exception("Ошибка проверки поля %s", uid)
+        await asyncio.sleep(ALERT_EVERY_HOURS * 3600)
+
+
+async def main():
+    if not BOT_TOKEN:
+        raise SystemExit("Задайте переменную окружения BOT_TOKEN.")
+    init_ee()
+    bot = Bot(
+        token=BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+    alert_task = asyncio.create_task(alert_loop(bot))
+    try:
+        await dp.start_polling(bot)
+    finally:
+        alert_task.cancel()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+
+
+
+
+
+
 
